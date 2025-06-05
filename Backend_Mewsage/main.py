@@ -1,59 +1,104 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException
+import os
+from fastapi import FastAPI, File, UploadFile, HTTPException, Response, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
+from fastapi.security import APIKeyHeader
 import numpy as np
 import librosa
 import io
-import os
 from pathlib import Path
 import tensorflow as tf
 from sklearn.preprocessing import LabelEncoder
 import json
+import logging
+from typing import Dict, Optional
 
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Initialize app
-app = FastAPI(title="Cat Sound Classifier API")
+app = FastAPI(
+    title="Cat Sound Classifier API",
+    description="API for classifying cat sounds using CNN+LSTM model",
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url=None
+)
 
-# Configure CORS for Flutter app compatibility
+# Security - API Key (set via environment variable in Render)
+API_KEY_NAME = "X-API-KEY"
+api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
+
+async def get_api_key(api_key: str = Depends(api_key_header)):
+    if api_key != os.getenv("API_KEY"):
+        raise HTTPException(
+            status_code=403,
+            detail="Invalid API Key"
+        )
+    return api_key
+
+# Configure CORS - adjust origins for production
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Adjust this in production
-    allow_methods=["POST", "GET"],
+    allow_origins=["*"],  # For production, specify your Flutter app's domains
+    allow_credentials=True,
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Load model and label encoder (should be in the same directory)
-MODEL_PATH = Path("catsound_class.keras")
+# Constants
+MODEL_PATH = Path("best_model.keras")
 LABEL_ENCODER_PATH = Path("label_encoder.json")
+MAX_FILE_SIZE_MB = 5  # 5MB max file size
+ALLOWED_CONTENT_TYPES = ["audio/wav", "audio/mpeg", "audio/x-wav"]
 
-# Update your loading code in main.py
-try:
-    model = tf.keras.models.load_model('catsound_class.keras')
-    model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
-    
-    # Load label encoder with better error handling
-    if not os.path.exists(LABEL_ENCODER_PATH):
-        raise FileNotFoundError(f"Label encoder file not found at {LABEL_ENCODER_PATH}")
+# Load model and label encoder at startup
+@app.on_event("startup")
+async def load_model_and_encoder():
+    try:
+        app.state.model = tf.keras.models.load_model(MODEL_PATH)
+        app.state.model.compile(optimizer='adam', 
+                              loss='categorical_crossentropy', 
+                              metrics=['accuracy'])
         
-    with open(LABEL_ENCODER_PATH, "r") as f:  # Explicitly open in read mode
-        label_encoder_classes = json.load(f)
+        with open(LABEL_ENCODER_PATH) as f:
+            label_encoder_classes = json.load(f)
+        app.state.label_encoder = LabelEncoder()
+        app.state.label_encoder.classes_ = np.array(label_encoder_classes)
         
-    label_encoder = LabelEncoder()
-    label_encoder.classes_ = np.array(label_encoder_classes)
-    
-except Exception as e:
-    print(f"CRITICAL ERROR: {str(e)}")
-    print("Please ensure both 'catsound_class' and 'label_encoder.json' exist in the same directory")
-    exit(1)  # Exit if files are missing
+        logger.info("Model and label encoder loaded successfully")
+    except Exception as e:
+        logger.error(f"Failed to load model or label encoder: {str(e)}")
+        raise
 
-def process_audio_file(audio_data: bytes):
-    """Process audio file from either upload or local path"""
+def validate_audio_file(file: UploadFile):
+    """Validate the uploaded audio file"""
+    # Check file size
+    file.file.seek(0, 2)  # Seek to end
+    file_size = file.file.tell()
+    file.file.seek(0)  # Reset pointer
+    
+    if file_size > MAX_FILE_SIZE_MB * 1024 * 1024:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large. Max size is {MAX_FILE_SIZE_MB}MB"
+        )
+    
+    # Check content type
+    if file.content_type not in ALLOWED_CONTENT_TYPES:
+        raise HTTPException(
+            status_code=415,
+            detail=f"Unsupported media type. Allowed: {ALLOWED_CONTENT_TYPES}"
+        )
+
+def process_audio_file(audio_data: bytes) -> np.ndarray:
+    """Process audio file into model-ready features"""
     try:
         # Convert bytes to audio stream
         audio_stream = io.BytesIO(audio_data)
         audio, sr = librosa.load(audio_stream, sr=22050)
         
-        # Feature extraction (same as your original)
+        # Feature extraction
         mel_spec = librosa.feature.melspectrogram(y=audio, sr=sr, n_mels=64, hop_length=512)
         mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
         
@@ -70,60 +115,79 @@ def process_audio_file(audio_data: bytes):
         return mel_spec_db.T[np.newaxis, ..., np.newaxis]  # Add batch and channel dims
     
     except Exception as e:
-        raise ValueError(f"Audio processing error: {str(e)}")
+        logger.error(f"Audio processing failed: {str(e)}")
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid audio file. Please provide a valid WAV or MP3 file."
+        )
+
+@app.get("/health", include_in_schema=False)
+async def health_check():
+    """Health check endpoint for Render monitoring"""
+    return Response(status_code=200)
 
 @app.post("/predict")
-async def predict_from_upload(file: UploadFile = File(...)):
-    """Endpoint for online prediction (file upload)"""
+async def predict_from_upload(
+    file: UploadFile = File(...),
+    api_key: str = Depends(get_api_key)
+):
+    """Endpoint for cat sound classification from audio upload"""
     try:
+        # Validate file
+        validate_audio_file(file)
+        
+        # Read and process file
         audio_data = await file.read()
         features = process_audio_file(audio_data)
         
         # Make prediction
-        proba = model.predict(features)[0]
+        proba = app.state.model.predict(features)[0]
         pred_class = np.argmax(proba)
-        class_name = label_encoder.inverse_transform([pred_class])[0]
+        class_name = app.state.label_encoder.inverse_transform([pred_class])[0]
+        
+        # Format probabilities
+        probabilities = {
+            label: float(prob) 
+            for label, prob in zip(app.state.label_encoder.classes_, proba)
+        }
+        
+        logger.info(f"Prediction successful: {class_name} (confidence: {proba.max():.2f})")
         
         return {
             "success": True,
             "prediction": class_name,
             "confidence": float(proba.max()),
-            "probabilities": {label: float(prob) for label, prob in zip(label_encoder.classes_, proba)}
+            "probabilities": probabilities
         }
     
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        logger.error(f"Prediction failed: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail="An error occurred during prediction. Please try again."
+        )
 
-@app.get("/predict-local")
-async def predict_from_local_path(file_path: str):
-    """Endpoint for offline prediction (local file path)"""
-    try:
-        # Security check - validate file path
-        if not os.path.exists(file_path):
-            raise ValueError("File not found")
-        
-        # Read local file
-        with open(file_path, 'rb') as f:
-            audio_data = f.read()
-        
-        features = process_audio_file(audio_data)
-        
-        # Make prediction
-        proba = model.predict(features)[0]
-        pred_class = np.argmax(proba)
-        class_name = label_encoder.inverse_transform([pred_class])[0]
-        
-        return {
-            "success": True,
-            "prediction": class_name,
-            "confidence": float(proba.max()),
-            "probabilities": {label: float(prob) for label, prob in zip(label_encoder.classes_, proba)}
-        }
-    
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+# Error handler
+@app.exception_handler(Exception)
+async def generic_exception_handler(request, exc):
+    logger.error(f"Unexpected error: {str(exc)}")
+    return Response(
+        content=json.dumps({
+            "success": False,
+            "error": "Internal server error"
+        }),
+        status_code=500,
+        media_type="application/json"
+    )
 
-# For testing offline functionality directly
+# For local testing
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port=int(os.getenv("PORT", 8000)),
+        log_level="info"
+    )
