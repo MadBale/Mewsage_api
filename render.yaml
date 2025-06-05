@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: cat-sound-classifier
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port=$PORT
+    envVars:
+      - key: API_KEY
+        value: your-secret-api-key-here
+      - key: PORT
+        value: 10000
+    plan: standard  # Required for TensorFlow
